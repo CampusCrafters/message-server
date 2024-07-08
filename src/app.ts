@@ -1,65 +1,46 @@
-import "dotenv/config";
 import express from "express";
 import WebSocket from "ws";
-import mongoose from "mongoose";
 import cookieParser from "cookie-parser";
 import axios from "axios";
 import cors from "cors";
-import { createClient } from "redis";
 import url from "url";
+import confessionsRouter from "./routes/confessions";
+import connectToMongoDB from "./config/db";
+import {
+  deliverQueuedMessages,
+  getConversation,
+  handleMessage,
+} from "./controllers/messageController";
 
-const HTTP_PORT = process.env.HTTP_PORT;
+const HTTP_PORT = process.env.HTTP_PORT as unknown as number;
 const WS_PORT = process.env.WS_PORT as unknown as number;
-const DATABASE_URL = process.env.DATABASE_URL;
 const VERIFY_API = process.env.VERIFY_API as string;
-const redisUrl = process.env.REDIS_URL;
-
-const corsOptions = {
-  origin: ["http://localhost:5173", "https://campustown.in"],
-  credentials: true,
-};
-
-const clientOptions = { serverApi: { version: '1', strict: true, deprecationErrors: true } };
-const uri = `${DATABASE_URL}`;
 
 const app = express();
-app.use(cors(corsOptions));
+app.use(
+  cors({
+    origin: ["http://localhost:5173", "https://campustown.in"],
+    credentials: true,
+  })
+);
 app.use(express.json());
 app.use(cookieParser());
+const clients = new Map<string, WebSocket>();
 
-async function run() {
+const startHTTPServer = async () => {
   try {
-    await mongoose.connect(uri, { ...clientOptions, serverApi: "1" });
-    await mongoose.connection.db.admin().command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } catch (e) {
-    console.error("Error connecting to MongoDB:", e);
+    await connectToMongoDB();
+    app.listen(HTTP_PORT, () => {
+      console.log(`HTTP server running on port ${HTTP_PORT}`);
+    });
+  } catch (error: any) {
+    console.error("Error in startHTTPServer", error.message);
   }
-}
-run().catch(console.dir);
+};
+startHTTPServer();
 
-const Schema = mongoose.Schema;
-const messageSchema = new Schema({
-  from: String,
-  to: String,
-  message: String,
-  timestamp: { type: Date, default: Date.now },
-});
-const Message = mongoose.model("Message", messageSchema);
-
-const redisClient = createClient({
-  url: `${redisUrl}`,
-});
-(async () => {
-  await redisClient.connect();
-})();
-
-redisClient.on("connect", () => console.log("::> Redis Client Connected"));
-redisClient.on("error", (err) => console.log("<:: Redis Client Error", err));
 const wss = new WebSocket.Server({ port: WS_PORT });
 console.log(`WebSocket server started on port ${WS_PORT}`);
-
-const clients = new Map();
 
 wss.on("connection", async (ws: WebSocket, req: any) => {
   ws.on("error", (err) => {
@@ -68,8 +49,7 @@ wss.on("connection", async (ws: WebSocket, req: any) => {
 
   const queryParams = url.parse(req.url, true).query;
   const token = queryParams.token as string;
-  //console.log("Token:", token);
-  
+
   if (!token) {
     ws.close(4002, "No JWT token");
     return;
@@ -123,72 +103,16 @@ app.get("/chat/:contact", async (req, res) => {
     const messages = await getConversation(contactName, username);
     res.json(messages);
   } catch (error: any) {
-    console.error(`Error retrieving conversations`, error.message);
+    console.error("Error retrieving conversations", error.message);
     return [];
   }
 });
 
-app.listen(HTTP_PORT, () => {
-  console.log(`HTTP server running on port ${HTTP_PORT}`);
-});
-
-/***************************************************************************************************/
-
-const getConversation = async (contact: string, username: string) => {
-  try {
-    const messages = await Message.find({
-      $or: [
-        { from: username, to: contact },
-        { from: contact, to: username },
-      ],
-    }).sort({ timestamp: 1 });
-    return messages;
-  } catch (error) {
-    console.error("Error retrieving conversation from MongoDB:", error);
-    return [];
-  }
-};
-
-const handleMessage = async (username: string, data: any) => {
-  const { to, message } = data;
-  const recipientWs = clients.get(to);
-  const timestamp = new Date().toISOString();
-  const newMessage = new Message({
-    from: username,
-    message: message,
-    timestamp: timestamp,
-    to: to,
-  });
-  await newMessage.save();
-
-  if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-    recipientWs.send(JSON.stringify(newMessage));
-  } else {
-    await redisClient.lPush(`messages:${to}`, JSON.stringify(newMessage));
-    console.log(
-      `User ${data.to} is offline, message pushed to queue and stored in MongoDB`
-    );
-  }
-};
-
-const deliverQueuedMessages = async (username: string, ws: WebSocket) => {
-  try {
-    while (true) {
-      const message = await redisClient.rPop(`messages:${username}`);
-      if (!message) {
-        break;
-      }
-      ws.send(message);
-    }
-    console.log(`Delivered queued messages to ${username}`);
-  } catch (error) {
-    console.error(`Error delivering messages to ${username}:`, error);
-  }
-};
+app.use("/api/v1/confessions", confessionsRouter);
 
 const authenticateJWT = async (token: string) => {
   try {
-    const response = await axios.post(VERIFY_API, { token: token });
+    const response = await axios.post(VERIFY_API, { token });
     return response.data.decoded;
   } catch (error: any) {
     console.error("Error verifying JWT:", error.message);
